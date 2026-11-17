@@ -38,7 +38,32 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 pub(crate) struct Conn<I, B, T> {
     io: Buffered<I, EncodedBuf<B>>,
     state: State,
+    serialization: H1Serialization,
     _marker: PhantomData<fn(T)>,
+}
+
+#[derive(Default)]
+struct H1Serialization {
+    observer: Option<std::sync::Arc<dyn crate::serialization::SerializationObserver>>,
+    identity: u64,
+    poisoned: bool,
+}
+impl Drop for H1Serialization {
+    fn drop(&mut self) {
+        if self.identity != 0 {
+            if let Some(observer) = &self.observer {
+                use crate::serialization::SerializedEvent;
+                let _ = observer.record(&[
+                    SerializedEvent::Abort {
+                        stream: self.identity,
+                    },
+                    SerializedEvent::Quiescent {
+                        stream: self.identity,
+                    },
+                ]);
+            }
+        }
+    }
 }
 
 impl<I, B, T> Conn<I, B, T>
@@ -84,8 +109,32 @@ where
                 version: Version::HTTP_11,
                 allow_trailer_fields: false,
             },
+            serialization: H1Serialization::default(),
             _marker: PhantomData,
         }
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn set_serialization_observer(
+        &mut self,
+        observer: std::sync::Arc<dyn crate::serialization::SerializationObserver>,
+    ) {
+        self.serialization.observer = Some(observer);
+    }
+
+    fn record_serialization(&mut self, plan: &crate::serialization::Plan) -> bool {
+        if self.serialization.poisoned {
+            return false;
+        }
+        if let Some(observer) = &self.serialization.observer {
+            if let Err(error) = observer.record(plan.as_slice()) {
+                self.serialization.poisoned = true;
+                self.state.error = Some(crate::Error::new_io(error));
+                self.state.writing = Writing::Closed;
+                return false;
+            }
+        }
+        true
     }
 
     #[cfg(feature = "server")]
@@ -407,6 +456,18 @@ where
                 if let Writing::Init = self.state.writing {
                     trace!("automatically sending 100 Continue");
                     let cont = b"HTTP/1.1 100 Continue\r\n\r\n";
+                    let mut plan = crate::serialization::Plan::new();
+                    plan.span(
+                        0,
+                        crate::serialization::SerializedClass::Control,
+                        cont.len(),
+                    );
+                    if let Some(observer) = &self.serialization.observer {
+                        if let Err(error) = observer.record(plan.as_slice()) {
+                            self.serialization.poisoned = true;
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                    }
                     self.io.headers_buf().extend_from_slice(cont);
                 }
 
@@ -627,7 +688,13 @@ where
 
         self.enforce_version(&mut head);
 
+        self.serialization.identity = head
+            .extensions
+            .get::<crate::serialization::ResponseIdentity>()
+            .map_or(0, |identity| identity.0.get());
         let buf = self.io.headers_buf();
+        let before = buf.len();
+
         match super::role::encode_headers::<T>(
             Encode {
                 head: &mut head,
@@ -642,6 +709,26 @@ where
             buf,
         ) {
             Ok(encoder) => {
+                use crate::serialization::{CompletionRequirement, Plan, SerializedClass};
+                let mut plan = Plan::new();
+                if encoder.is_eof() {
+                    plan.barrier(self.serialization.identity);
+                }
+                plan.span(
+                    self.serialization.identity,
+                    SerializedClass::Control,
+                    buf.len() - before,
+                );
+                if encoder.is_eof() {
+                    plan.end(self.serialization.identity, CompletionRequirement::Flush);
+                }
+                if !self.record_serialization(&plan) {
+                    return None;
+                }
+                if encoder.is_eof() {
+                    self.serialization.identity = 0;
+                }
+
                 debug_assert!(self.state.cached_headers.is_none());
                 debug_assert!(head.headers.is_empty());
                 self.state.cached_headers = Some(head.headers);
@@ -718,7 +805,37 @@ where
 
         let state = match &mut self.state.writing {
             Writing::Body(encoder) => {
-                self.io.buffer(encoder.encode(chunk));
+                let encoded = encoder.encode(chunk);
+                let terminal = encoder.is_eof();
+                let mut plan = crate::serialization::Plan::new();
+                if terminal {
+                    plan.barrier(self.serialization.identity);
+                }
+                for event in encoded
+                    .serialization(self.serialization.identity)
+                    .as_slice()
+                {
+                    plan.push(*event);
+                }
+                if terminal {
+                    plan.end(
+                        self.serialization.identity,
+                        crate::serialization::CompletionRequirement::Flush,
+                    );
+                }
+                // End is observed synchronously before Dispatcher disposes Body.
+                if let Some(observer) = &self.serialization.observer {
+                    if let Err(error) = observer.record(plan.as_slice()) {
+                        self.serialization.poisoned = true;
+                        self.state.error = Some(crate::Error::new_io(error));
+                        self.state.writing = Writing::Closed;
+                        return;
+                    }
+                }
+                if terminal {
+                    self.serialization.identity = 0;
+                }
+                self.io.buffer(encoded);
 
                 if !encoder.is_eof() {
                     return;
@@ -748,6 +865,27 @@ where
                 if let Some(enc_buf) =
                     encoder.encode_trailers(trailers, self.state.title_case_headers)
                 {
+                    let mut plan = crate::serialization::Plan::new();
+                    plan.barrier(self.serialization.identity);
+                    for event in enc_buf
+                        .serialization(self.serialization.identity)
+                        .as_slice()
+                    {
+                        plan.push(*event);
+                    }
+                    plan.end(
+                        self.serialization.identity,
+                        crate::serialization::CompletionRequirement::Flush,
+                    );
+                    if let Some(observer) = &self.serialization.observer {
+                        if let Err(error) = observer.record(plan.as_slice()) {
+                            self.serialization.poisoned = true;
+                            self.state.error = Some(crate::Error::new_io(error));
+                            self.state.writing = Writing::Closed;
+                            return;
+                        }
+                    }
+                    self.serialization.identity = 0;
                     self.io.buffer(enc_buf);
 
                     self.state.writing = if encoder.is_last() || encoder.is_close_delimited() {
@@ -766,17 +904,34 @@ where
         // empty chunks should be discarded at Dispatcher level
         debug_assert!(chunk.remaining() != 0);
 
-        let state = match &mut self.state.writing {
-            Writing::Body(encoder) => {
-                let can_keep_alive = encoder.encode_and_end(chunk, self.io.write_buf());
-                if can_keep_alive {
-                    Writing::KeepAlive
-                } else {
-                    Writing::Closed
+        let state =
+            match &mut self.state.writing {
+                Writing::Body(encoder) => {
+                    let plan = encoder
+                        .serialization_and_end(self.serialization.identity, chunk.remaining());
+                    if let Some(observer) = &self.serialization.observer {
+                        if let Err(error) = observer.record(plan.as_slice()) {
+                            self.serialization.poisoned = true;
+                            self.state.error = Some(crate::Error::new_io(error));
+                            self.state.writing = Writing::Closed;
+                            return;
+                        }
+                    }
+                    if plan.as_slice().iter().any(|event| {
+                        matches!(event, crate::serialization::SerializedEvent::End { .. })
+                    }) {
+                        self.serialization.identity = 0;
+                    }
+                    let can_keep_alive = encoder.encode_and_end(chunk, self.io.write_buf());
+
+                    if can_keep_alive {
+                        Writing::KeepAlive
+                    } else {
+                        Writing::Closed
+                    }
                 }
-            }
-            _ => unreachable!("write_body invalid state: {:?}", self.state.writing),
-        };
+                _ => unreachable!("write_body invalid state: {:?}", self.state.writing),
+            };
 
         self.state.writing = state;
     }
@@ -792,6 +947,28 @@ where
         // end of stream, that means we should try to eof
         match encoder.end() {
             Ok(end) => {
+                let mut plan = crate::serialization::Plan::new();
+                plan.barrier(self.serialization.identity);
+                if let Some(ref end) = end {
+                    for event in end.serialization(self.serialization.identity).as_slice() {
+                        plan.push(*event);
+                    }
+                }
+                let requirement = if encoder.is_close_delimited() {
+                    crate::serialization::CompletionRequirement::Shutdown
+                } else {
+                    crate::serialization::CompletionRequirement::Flush
+                };
+                plan.end(self.serialization.identity, requirement);
+                if let Some(observer) = &self.serialization.observer {
+                    if let Err(error) = observer.record(plan.as_slice()) {
+                        self.serialization.poisoned = true;
+                        self.state.writing = Writing::Closed;
+                        return Err(crate::Error::new_io(error));
+                    }
+                }
+                self.serialization.identity = 0;
+
                 if let Some(end) = end {
                     self.io.buffer(end);
                 }
@@ -836,13 +1013,26 @@ where
     }
 
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.serialization.poisoned {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Other,
+                "serialization observer failed",
+            )));
+        }
         ready!(Pin::new(&mut self.io).poll_flush(cx))?;
+
         self.try_keep_alive(cx);
         trace!("flushed({}): {:?}", T::LOG, self.state);
         Poll::Ready(Ok(()))
     }
 
     pub(crate) fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.serialization.poisoned {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Other,
+                "serialization observer failed",
+            )));
+        }
         match ready!(self.io.poll_shutdown(cx)) {
             Ok(()) => {
                 trace!("shut down IO complete");

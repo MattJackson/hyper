@@ -106,10 +106,17 @@ where
 // ===== impl Builder =====
 
 impl<E> Builder<E> {
-    /// Create a new connection builder.
-    ///
-    /// This starts with the default options, and an executor which is a type
-    /// that implements [`Http2ServerConnExec`] trait.
+    /// Observe exact outgoing serialization and gate terminal frames before
+    /// connection flow debit and HPACK mutation.
+    pub fn serialization_observer(
+        &mut self,
+        observer: std::sync::Arc<dyn crate::serialization::SerializationObserver>,
+    ) -> &mut Self {
+        self.h2_builder.observer = Some(observer);
+        self
+    }
+
+    /// Create a connection builder using an [`Http2ServerConnExec`] executor.
     ///
     /// [`Http2ServerConnExec`]: crate::rt::bounds::Http2ServerConnExec
     pub fn new(exec: E) -> Self {

@@ -221,6 +221,42 @@ impl Encoder {
         }
     }
 
+    pub(crate) fn serialization_and_end(
+        &self,
+        stream: u64,
+        len: usize,
+    ) -> crate::serialization::Plan {
+        use crate::serialization::{CompletionRequirement, Plan, SerializedClass::*};
+        let mut plan = Plan::new();
+        match self.kind {
+            Kind::Chunked(_) => {
+                plan.span(stream, Control, ChunkSize::new(len).remaining());
+                plan.span(stream, Payload, len);
+                plan.span(stream, Control, 2);
+                plan.barrier(stream);
+                plan.span(stream, Control, 5);
+                plan.end(stream, CompletionRequirement::Flush);
+            }
+            Kind::Length(remaining) => {
+                let terminal = len as u64 >= remaining;
+                if terminal {
+                    plan.barrier(stream);
+                }
+                plan.span(stream, Payload, (len as u64).min(remaining) as usize);
+                if terminal {
+                    plan.end(stream, CompletionRequirement::Flush);
+                }
+            }
+            #[cfg(feature = "server")]
+            Kind::CloseDelimited => {
+                plan.span(stream, Payload, len);
+                plan.barrier(stream);
+                plan.end(stream, CompletionRequirement::Shutdown);
+            }
+        }
+        plan
+    }
+
     pub(super) fn encode_and_end<B>(&self, msg: B, dst: &mut WriteBuf<EncodedBuf<B>>) -> bool
     where
         B: Buf,
@@ -283,6 +319,28 @@ fn is_valid_trailer_field(name: &HeaderName) -> bool {
             | TRANSFER_ENCODING
             | TE
     )
+}
+
+impl<B: Buf> EncodedBuf<B> {
+    pub(crate) fn serialization(&self, stream: u64) -> crate::serialization::Plan {
+        use crate::serialization::{Plan, SerializedClass::*};
+        let mut plan = Plan::new();
+        match &self.kind {
+            BufKind::Exact(b) => plan.span(stream, Payload, b.remaining()),
+            BufKind::Limited(b) => plan.span(stream, Payload, b.remaining()),
+            BufKind::Chunked(b) => {
+                let (head_body, tail) = b.get_ref();
+                let (head, body) = head_body.get_ref();
+                plan.span(stream, Control, head.remaining());
+                plan.span(stream, Payload, body.remaining());
+                plan.span(stream, Control, tail.remaining());
+            }
+            BufKind::ChunkedEnd(_) | BufKind::Trailers(_) => {
+                plan.span(stream, Control, self.remaining());
+            }
+        }
+        plan
+    }
 }
 
 impl<B> Buf for EncodedBuf<B>
@@ -715,42 +773,101 @@ mod serialization_tests {
     fn serialization_uses_encoded_limit_and_chunk_boundaries() {
         let mut exact = Encoder::length(3);
         let buf = exact.encode(&b"abcdef"[..]);
-        assert_eq!(spans(&buf), vec![SerializedEvent::Span {
-            stream: 17, class: SerializedClass::Payload, len: 3,
-        }]);
+        assert_eq!(
+            spans(&buf),
+            vec![SerializedEvent::Span {
+                stream: 17,
+                class: SerializedClass::Payload,
+                len: 3,
+            }]
+        );
         assert_eq!(buf.remaining(), 3);
         let mut chunked = Encoder::chunked();
         let buf = chunked.encode(&b"abc"[..]);
-        assert_eq!(spans(&buf), vec![
-            SerializedEvent::Span { stream: 17, class: SerializedClass::Control, len: 3 },
-            SerializedEvent::Span { stream: 17, class: SerializedClass::Payload, len: 3 },
-            SerializedEvent::Span { stream: 17, class: SerializedClass::Control, len: 2 },
-        ]);
+        assert_eq!(
+            spans(&buf),
+            vec![
+                SerializedEvent::Span {
+                    stream: 17,
+                    class: SerializedClass::Control,
+                    len: 3
+                },
+                SerializedEvent::Span {
+                    stream: 17,
+                    class: SerializedClass::Payload,
+                    len: 3
+                },
+                SerializedEvent::Span {
+                    stream: 17,
+                    class: SerializedClass::Control,
+                    len: 2
+                },
+            ]
+        );
         let end = chunked.end::<&[u8]>().unwrap().unwrap();
-        assert_eq!(spans(&end), vec![SerializedEvent::Span {
-            stream: 17, class: SerializedClass::Control, len: 5,
-        }]);
+        assert_eq!(
+            spans(&end),
+            vec![SerializedEvent::Span {
+                stream: 17,
+                class: SerializedClass::Control,
+                len: 5,
+            }]
+        );
     }
 
     #[test]
     fn serialization_fast_end_gates_only_terminal_chunk_and_never_underflow() {
         use crate::serialization::{CompletionRequirement, SerializedEvent::*};
         let plan = Encoder::chunked().serialization_and_end(17, 3);
-        assert_eq!(plan.as_slice(), &[
-            Span { stream: 17, class: SerializedClass::Control, len: 3 },
-            Span { stream: 17, class: SerializedClass::Payload, len: 3 },
-            Span { stream: 17, class: SerializedClass::Control, len: 2 },
-            ReleaseBarrier { stream: 17 },
-            Span { stream: 17, class: SerializedClass::Control, len: 5 },
-            End { stream: 17, requirement: CompletionRequirement::Flush },
-            Quiescent { stream: 17 },
-        ]);
+        assert_eq!(
+            plan.as_slice(),
+            &[
+                Span {
+                    stream: 17,
+                    class: SerializedClass::Control,
+                    len: 3
+                },
+                Span {
+                    stream: 17,
+                    class: SerializedClass::Payload,
+                    len: 3
+                },
+                Span {
+                    stream: 17,
+                    class: SerializedClass::Control,
+                    len: 2
+                },
+                ReleaseBarrier { stream: 17 },
+                Span {
+                    stream: 17,
+                    class: SerializedClass::Control,
+                    len: 5
+                },
+                End {
+                    stream: 17,
+                    requirement: CompletionRequirement::Flush
+                },
+                Quiescent { stream: 17 },
+            ]
+        );
         let underflow = Encoder::length(4).serialization_and_end(17, 3);
-        assert_eq!(underflow.as_slice(), &[
-            Span { stream: 17, class: SerializedClass::Payload, len: 3 },
-        ]);
+        assert_eq!(
+            underflow.as_slice(),
+            &[Span {
+                stream: 17,
+                class: SerializedClass::Payload,
+                len: 3
+            },]
+        );
         let limited = Encoder::length(3).serialization_and_end(17, 5);
         assert_eq!(limited.as_slice()[0], ReleaseBarrier { stream: 17 });
-        assert_eq!(limited.as_slice()[1], Span { stream: 17, class: SerializedClass::Payload, len: 3 });
+        assert_eq!(
+            limited.as_slice()[1],
+            Span {
+                stream: 17,
+                class: SerializedClass::Payload,
+                len: 3
+            }
+        );
     }
 }

@@ -70,6 +70,7 @@ pin_project_lite::pin_project! {
 /// to bind the built connection to a service.
 #[derive(Clone, Debug)]
 pub struct Builder {
+    observer: Option<std::sync::Arc<dyn crate::serialization::SerializationObserver>>,
     h1_parser_config: ParserConfig,
     timer: Time,
     h1_half_close: bool,
@@ -239,9 +240,20 @@ where
 // ===== impl Builder =====
 
 impl Builder {
+    /// Observe exact outgoing serialization. The sink must gate terminal bytes
+    /// at ReleaseBarrier and report IO progress separately.
+    pub fn serialization_observer(
+        &mut self,
+        observer: std::sync::Arc<dyn crate::serialization::SerializationObserver>,
+    ) -> &mut Self {
+        self.observer = Some(observer);
+        self
+    }
+
     /// Create a new connection builder.
     pub fn new() -> Self {
         Self {
+            observer: None,
             h1_parser_config: ParserConfig::default(),
             timer: Time::Empty,
             h1_half_close: false,
@@ -476,6 +488,9 @@ impl Builder {
         I: Read + Write + Unpin,
     {
         let mut conn = proto::Conn::new(io);
+        if let Some(observer) = &self.observer {
+            conn.set_serialization_observer(observer.clone());
+        }
         conn.set_h1_parser_config(self.h1_parser_config.clone());
         conn.set_timer(self.timer.clone());
         if !self.h1_keep_alive {

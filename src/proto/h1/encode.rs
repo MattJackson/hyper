@@ -323,8 +323,8 @@ impl<B: Buf> EncodedBuf<B> {
             BufKind::Exact(b) => plan.span(stream, Payload, b.remaining()),
             BufKind::Limited(b) => plan.span(stream, Payload, b.remaining()),
             BufKind::Chunked(b) => {
-                let (head_body, tail) = b.get_ref();
-                let (head, body) = head_body.get_ref();
+                let (head_body, tail) = (b.first_ref(), b.last_ref());
+                let (head, body) = (head_body.first_ref(), head_body.last_ref());
                 plan.span(stream, Control, head.remaining());
                 plan.span(stream, Payload, body.remaining());
                 plan.span(stream, Control, tail.remaining());

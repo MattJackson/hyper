@@ -126,6 +126,7 @@ where
 /// are subject to change at any time.
 #[derive(Clone, Debug)]
 pub struct Builder {
+    labels: Option<std::sync::Arc<dyn crate::serialization::Labels>>,
     h09_responses: bool,
     h1_parser_config: ParserConfig,
     h1_writev: Option<bool>,
@@ -348,6 +349,7 @@ impl Builder {
     pub fn new() -> Builder {
         Builder {
             h09_responses: false,
+            labels: None,
             h1_writev: None,
             h1_read_buf_exact_size: None,
             h1_parser_config: ParserConfig::default(),
@@ -440,6 +442,16 @@ impl Builder {
     pub fn ignore_invalid_headers_in_responses(&mut self, enabled: bool) -> &mut Builder {
         self.h1_parser_config
             .ignore_invalid_headers_in_responses(enabled);
+        self
+    }
+
+    /// Label every byte this connection encodes (see [`crate::serialization::Labels`]). With a
+    /// sink, a request header value marked sensitive is a sealed value: its bytes are never written.
+    pub fn labels(
+        &mut self,
+        labels: std::sync::Arc<dyn crate::serialization::Labels>,
+    ) -> &mut Builder {
+        self.labels = Some(labels);
         self
     }
 
@@ -589,6 +601,9 @@ impl Builder {
             let (tx, rx) = dispatch::channel();
             let mut conn = proto::Conn::new(io);
             conn.set_h1_parser_config(opts.h1_parser_config);
+            if let Some(labels) = opts.labels {
+                conn.set_labels(labels);
+            }
             if let Some(writev) = opts.h1_writev {
                 if writev {
                     conn.set_write_strategy_queue();

@@ -42,7 +42,7 @@ const DEFAULT_MAX_LOCAL_ERROR_RESET_STREAMS: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
-    pub(crate) observer: Option<std::sync::Arc<dyn crate::serialization::SerializationObserver>>,
+    pub(crate) labels: Option<std::sync::Arc<dyn crate::serialization::Labels>>,
     pub(crate) adaptive_window: bool,
     pub(crate) initial_conn_window_size: u32,
     pub(crate) initial_stream_window_size: u32,
@@ -62,7 +62,7 @@ pub(crate) struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
-            observer: None,
+            labels: None,
             adaptive_window: false,
             initial_conn_window_size: DEFAULT_CONN_WINDOW,
             initial_stream_window_size: DEFAULT_STREAM_WINDOW,
@@ -135,10 +135,10 @@ where
         timer: Time,
     ) -> Server<T, S, B, E> {
         let mut builder = h2::server::Builder::default();
-        if let Some(observer) = &config.observer {
-            builder.serialization_observer(std::sync::Arc::new(
-                crate::serialization::H2Observer::new(observer.clone()),
-            ));
+        if let Some(labels) = &config.labels {
+            builder.labels(std::sync::Arc::new(crate::serialization::H2Labels(
+                labels.clone(),
+            )));
         }
         builder
             .initial_window_size(config.initial_stream_window_size)
@@ -312,10 +312,6 @@ where
                             req.extensions_mut().insert(Protocol::from_inner(protocol));
                         }
 
-                        req.extensions_mut()
-                            .insert(crate::serialization::ResponseBinder(
-                                respond.response_identity_binder(),
-                            ));
                         let fut = H2Stream::new(
                             service.call(req),
                             connect_parts,
@@ -478,15 +474,6 @@ where
                         }
                     };
 
-                    if let Some(identity) = res
-                        .extensions()
-                        .get::<crate::serialization::ResponseIdentity>()
-                    {
-                        if let Err(error) = me.reply.bind_response_identity(identity.0.get()) {
-                            me.reply.send_reset(Reason::INTERNAL_ERROR);
-                            return Poll::Ready(Err(crate::Error::new_h2(error)));
-                        }
-                    }
                     let (head, body) = res.into_parts();
 
                     let mut res = ::http::Response::from_parts(head, ());

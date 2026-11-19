@@ -369,6 +369,17 @@ where
         self
     }
 
+    /// Label every byte this connection encodes (see [`crate::serialization::Labels`]): each frame
+    /// under its wire stream identifier; [`crate::serialization::Labels::request`] tells which stream
+    /// each submitted request got. A header value marked sensitive is a sealed value.
+    pub fn labels(
+        &mut self,
+        labels: std::sync::Arc<dyn crate::serialization::Labels>,
+    ) -> &mut Self {
+        self.h2_builder.labels = Some(labels);
+        self
+    }
+
     /// Sets whether to use an adaptive flow control.
     ///
     /// Enabling this will override the limits set in

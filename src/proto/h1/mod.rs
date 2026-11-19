@@ -92,6 +92,8 @@ pub(crate) struct Encode<'encode, T> {
     title_case_headers: bool,
     #[cfg(feature = "server")]
     date_header: bool,
+    /// Where sealed values were left out of the encoded head (a client with a label sink; else off).
+    marks: &'encode mut crate::serialization::Marks,
 }
 
 /// Extra flags that a request "wants", like expect-continue or upgrades.

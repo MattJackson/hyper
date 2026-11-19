@@ -221,37 +221,28 @@ impl Encoder {
         }
     }
 
-    pub(crate) fn serialization_and_end(
-        &self,
-        stream: u64,
-        len: usize,
-    ) -> crate::serialization::Plan {
-        use crate::serialization::{CompletionRequirement, Plan, SerializedClass::*};
+    /// The runs `encode_and_end` writes for a last chunk of `len` bytes, and the message's end.
+    pub(crate) fn serialization_and_end(&self, len: usize) -> crate::serialization::Plan {
+        use crate::serialization::{End, Plan};
         let mut plan = Plan::new();
         match self.kind {
             Kind::Chunked(_) => {
-                plan.span(stream, Control, ChunkSize::new(len).remaining());
-                plan.span(stream, Payload, len);
-                plan.span(stream, Control, 2);
-                plan.barrier(stream);
-                plan.span(stream, Control, 5);
-                plan.end(stream, CompletionRequirement::Flush);
+                plan.control(ChunkSize::new(len).remaining());
+                plan.payload(len);
+                // The chunk's line end and the last chunk (`0\r\n\r\n`).
+                plan.control(2 + 5);
+                plan.end = Some(End::Flush);
             }
             Kind::Length(remaining) => {
-                let terminal = len as u64 >= remaining;
-                if terminal {
-                    plan.barrier(stream);
-                }
-                plan.span(stream, Payload, (len as u64).min(remaining) as usize);
-                if terminal {
-                    plan.end(stream, CompletionRequirement::Flush);
+                plan.payload((len as u64).min(remaining) as usize);
+                if len as u64 >= remaining {
+                    plan.end = Some(End::Flush);
                 }
             }
             #[cfg(feature = "server")]
             Kind::CloseDelimited => {
-                plan.span(stream, Payload, len);
-                plan.barrier(stream);
-                plan.end(stream, CompletionRequirement::Shutdown);
+                plan.payload(len);
+                plan.end = Some(End::Shutdown);
             }
         }
         plan
@@ -322,21 +313,22 @@ fn is_valid_trailer_field(name: &HeaderName) -> bool {
 }
 
 impl<B: Buf> EncodedBuf<B> {
-    pub(crate) fn serialization(&self, stream: u64) -> crate::serialization::Plan {
-        use crate::serialization::{Plan, SerializedClass::*};
+    /// The runs of this encoded unit.
+    pub(crate) fn serialization(&self) -> crate::serialization::Plan {
+        use crate::serialization::Plan;
         let mut plan = Plan::new();
         match &self.kind {
-            BufKind::Exact(b) => plan.span(stream, Payload, b.remaining()),
-            BufKind::Limited(b) => plan.span(stream, Payload, b.remaining()),
+            BufKind::Exact(b) => plan.payload(b.remaining()),
+            BufKind::Limited(b) => plan.payload(b.remaining()),
             BufKind::Chunked(b) => {
                 let (head_body, tail) = (b.first_ref(), b.last_ref());
                 let (head, body) = (head_body.first_ref(), head_body.last_ref());
-                plan.span(stream, Control, head.remaining());
-                plan.span(stream, Payload, body.remaining());
-                plan.span(stream, Control, tail.remaining());
+                plan.control(head.remaining());
+                plan.payload(body.remaining());
+                plan.control(tail.remaining());
             }
             BufKind::ChunkedEnd(_) | BufKind::Trailers(_) => {
-                plan.span(stream, Control, self.remaining());
+                plan.control(self.remaining());
             }
         }
         plan
@@ -763,111 +755,43 @@ mod tests {
 #[cfg(test)]
 mod serialization_tests {
     use super::*;
-    use crate::serialization::{SerializedClass, SerializedEvent};
+    use crate::serialization::{End, Run};
 
-    fn spans<B: Buf>(buf: &EncodedBuf<B>) -> Vec<SerializedEvent> {
-        buf.serialization(17).as_slice().to_vec()
+    fn run(payload: bool, len: usize) -> Run {
+        Run { payload, len }
     }
 
     #[test]
-    fn serialization_uses_encoded_limit_and_chunk_boundaries() {
+    fn a_length_body_is_payload_up_to_its_limit_and_a_chunk_is_framed_by_control() {
         let mut exact = Encoder::length(3);
         let buf = exact.encode(&b"abcdef"[..]);
-        assert_eq!(
-            spans(&buf),
-            vec![SerializedEvent::Span {
-                stream: 17,
-                class: SerializedClass::Payload,
-                len: 3,
-            }]
-        );
-        assert_eq!(buf.remaining(), 3);
+        assert_eq!(buf.serialization().as_slice(), [run(true, 3)]);
+
         let mut chunked = Encoder::chunked();
         let buf = chunked.encode(&b"abc"[..]);
         assert_eq!(
-            spans(&buf),
-            vec![
-                SerializedEvent::Span {
-                    stream: 17,
-                    class: SerializedClass::Control,
-                    len: 3
-                },
-                SerializedEvent::Span {
-                    stream: 17,
-                    class: SerializedClass::Payload,
-                    len: 3
-                },
-                SerializedEvent::Span {
-                    stream: 17,
-                    class: SerializedClass::Control,
-                    len: 2
-                },
-            ]
+            buf.serialization().as_slice(),
+            [run(false, 3), run(true, 3), run(false, 2)]
         );
         let end = chunked.end::<&[u8]>().unwrap().unwrap();
-        assert_eq!(
-            spans(&end),
-            vec![SerializedEvent::Span {
-                stream: 17,
-                class: SerializedClass::Control,
-                len: 5,
-            }]
-        );
+        assert_eq!(end.serialization().as_slice(), [run(false, 5)]);
     }
 
     #[test]
-    fn serialization_fast_end_gates_only_terminal_chunk_and_never_underflow() {
-        use crate::serialization::{CompletionRequirement, SerializedEvent::*};
-        let plan = Encoder::chunked().serialization_and_end(17, 3);
+    fn the_fast_end_states_the_end_only_when_the_message_is_complete() {
+        let plan = Encoder::chunked().serialization_and_end(3);
         assert_eq!(
             plan.as_slice(),
-            &[
-                Span {
-                    stream: 17,
-                    class: SerializedClass::Control,
-                    len: 3
-                },
-                Span {
-                    stream: 17,
-                    class: SerializedClass::Payload,
-                    len: 3
-                },
-                Span {
-                    stream: 17,
-                    class: SerializedClass::Control,
-                    len: 2
-                },
-                ReleaseBarrier { stream: 17 },
-                Span {
-                    stream: 17,
-                    class: SerializedClass::Control,
-                    len: 5
-                },
-                End {
-                    stream: 17,
-                    requirement: CompletionRequirement::Flush
-                },
-                Quiescent { stream: 17 },
-            ]
+            [run(false, 3), run(true, 3), run(false, 7)]
         );
-        let underflow = Encoder::length(4).serialization_and_end(17, 3);
-        assert_eq!(
-            underflow.as_slice(),
-            &[Span {
-                stream: 17,
-                class: SerializedClass::Payload,
-                len: 3
-            },]
-        );
-        let limited = Encoder::length(3).serialization_and_end(17, 5);
-        assert_eq!(limited.as_slice()[0], ReleaseBarrier { stream: 17 });
-        assert_eq!(
-            limited.as_slice()[1],
-            Span {
-                stream: 17,
-                class: SerializedClass::Payload,
-                len: 3
-            }
-        );
+        assert_eq!(plan.end, Some(End::Flush));
+
+        let short = Encoder::length(4).serialization_and_end(3);
+        assert_eq!(short.as_slice(), [run(true, 3)]);
+        assert_eq!(short.end, None);
+
+        let over = Encoder::length(3).serialization_and_end(5);
+        assert_eq!(over.as_slice(), [run(true, 3)]);
+        assert_eq!(over.end, Some(End::Flush));
     }
 }

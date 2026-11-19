@@ -106,13 +106,13 @@ where
 // ===== impl Builder =====
 
 impl<E> Builder<E> {
-    /// Observe exact outgoing serialization and gate terminal frames before
-    /// connection flow debit and HPACK mutation.
-    pub fn serialization_observer(
+    /// Label every byte this connection encodes (see [`crate::serialization::Labels`]): each frame
+    /// under its wire stream identifier, which [`crate::body::Incoming::wire_stream`] gives for a request.
+    pub fn labels(
         &mut self,
-        observer: std::sync::Arc<dyn crate::serialization::SerializationObserver>,
+        labels: std::sync::Arc<dyn crate::serialization::Labels>,
     ) -> &mut Self {
-        self.h2_builder.observer = Some(observer);
+        self.h2_builder.labels = Some(labels);
         self
     }
 

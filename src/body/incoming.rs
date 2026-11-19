@@ -75,6 +75,17 @@ enum Kind {
 pub(crate) use super::chan::Sender;
 
 impl Incoming {
+    /// The HTTP/2 wire stream identifier of the message this body belongs to; `None` on HTTP/1.
+    /// With [`crate::serialization::Labels`] this is the name a response to this request is labelled
+    /// with.
+    pub fn wire_stream(&self) -> Option<u32> {
+        match &self.kind {
+            #[cfg(all(feature = "http2", any(feature = "client", feature = "server")))]
+            Kind::H2 { recv, .. } => Some(recv.stream_id().as_u32()),
+            _ => None,
+        }
+    }
+
     /// Create a `Body` stream with an associated sender half.
     ///
     /// Useful when wanting to stream chunks from another thread.

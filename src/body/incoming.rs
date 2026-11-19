@@ -53,6 +53,8 @@ enum Kind {
         data_done: bool,
         ping: ping::Recorder,
         recv: h2::RecvStream,
+        /// The receive window is reopened only by `Incoming::release_capacity`, never by reading.
+        manual: bool,
     },
     #[cfg(feature = "ffi")]
     Ffi(crate::ffi::UserBody),
@@ -75,6 +77,29 @@ enum Kind {
 pub(crate) use super::chan::Sender;
 
 impl Incoming {
+    /// HTTP/2: stop reopening the receive window as the body is read. From here on the far end may
+    /// send only what [`Incoming::release_capacity`] gives back, so whoever reads this body bounds what
+    /// it can be made to hold by the stream's window. No effect on HTTP/1.
+    pub fn manual_flow_control(&mut self) {
+        match &mut self.kind {
+            #[cfg(all(feature = "http2", any(feature = "client", feature = "server")))]
+            Kind::H2 { manual, .. } => *manual = true,
+            _ => {}
+        }
+    }
+
+    /// HTTP/2, after [`Incoming::manual_flow_control`]: reopen the receive window by `len` bytes that
+    /// were read from this body. More than was read is ignored by the stream. No effect on HTTP/1.
+    pub fn release_capacity(&mut self, len: usize) {
+        match &mut self.kind {
+            #[cfg(all(feature = "http2", any(feature = "client", feature = "server")))]
+            Kind::H2 { recv, .. } => {
+                let _ = recv.flow_control().release_capacity(len);
+            }
+            _ => {}
+        }
+    }
+
     /// The HTTP/2 wire stream identifier of the message this body belongs to; `None` on HTTP/1.
     /// With [`crate::serialization::Labels`] this is the name a response to this request is labelled
     /// with.
@@ -135,6 +160,7 @@ impl Incoming {
             ping,
             content_length,
             recv,
+            manual: false,
         })
     }
 
@@ -192,11 +218,14 @@ impl Body for Incoming {
                 ping,
                 recv: h2,
                 content_length: len,
+                manual,
             } => {
                 if !*data_done {
                     match ready!(h2.poll_data(cx)) {
                         Some(Ok(bytes)) => {
-                            let _ = h2.flow_control().release_capacity(bytes.len());
+                            if !*manual {
+                                let _ = h2.flow_control().release_capacity(bytes.len());
+                            }
                             len.sub_if(bytes.len() as u64);
                             ping.record_data(bytes.len());
                             return Poll::Ready(Some(Ok(Frame::data(bytes))));

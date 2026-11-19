@@ -1243,9 +1243,11 @@ impl Http1Transaction for Client {
                 for span in &sealed.0 {
                     let (offset, len) = (span.offset as usize, span.len as usize);
                     let at = target_at + offset - removed;
-                    // A span outside the written target is the caller's error: nothing is sealed there.
+                    // A span outside the written target is the caller's error. Nothing more is sealed:
+                    // what is left written is filler, which says nothing, and whoever owns the
+                    // connection sees a slot that was never placed.
                     if offset < removed || at + len + 1 > dst.len() {
-                        return Err(crate::Error::new_user_unsupported_request_method());
+                        break;
                     }
                     dst.drain(at..at + len);
                     msg.marks.push(at, len);

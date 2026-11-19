@@ -2831,6 +2831,7 @@ mod tests {
                             title_case_headers: false,
                             #[cfg(feature = "server")]
                             date_header: true,
+                            marks: &mut crate::serialization::Marks::default(),
                         },
                         &mut vec,
                     )
@@ -2887,6 +2888,7 @@ mod tests {
                     title_case_headers: false,
                     #[cfg(feature = "server")]
                     date_header: true,
+                    marks: &mut crate::serialization::Marks::default(),
                 },
                 &mut vec,
             )
@@ -3637,6 +3639,7 @@ mod tests {
                     req_method: &mut Some(Method::GET),
                     title_case_headers: false,
                     date_header: true,
+                    marks: &mut crate::serialization::Marks::default(),
                 },
                 &mut vec,
             )
@@ -3666,6 +3669,7 @@ mod tests {
                     req_method: &mut Some(Method::GET),
                     title_case_headers: false,
                     date_header: true,
+                    marks: &mut crate::serialization::Marks::default(),
                 },
                 &mut vec,
             )

@@ -5,9 +5,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::rt::{Read, ReadBuf, Write};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+#[cfg(all(test, feature = "nightly"))]
+use bytes::BytesMut;
+use bytes::{Buf, BufMut, Bytes};
 use futures_core::ready;
 
+use super::wipe::{self, WipingBuf};
 use super::{Http1Transaction, ParseContext, ParsedMessage};
 use crate::common::buf::BufList;
 
@@ -29,12 +32,18 @@ pub(crate) const DEFAULT_MAX_BUFFER_SIZE: usize = 8192 + 4096 * 100;
 /// forces a flush if the queue gets this big.
 const MAX_BUF_LIST_BUFFERS: usize = 16;
 
+/// What `BytesMut::chunk_mut` reserves when called on a full buffer (bytes 1.x,
+/// `impl BufMut for BytesMut`). The read path makes this growth itself, through the wiping
+/// reserve, so the old block is wiped before it is freed.
+const CHUNK_MUT_GROWTH: usize = 64;
+
 pub(crate) struct Buffered<T, B> {
     flush_pipeline: bool,
     io: T,
     partial_len: Option<usize>,
     read_blocked: bool,
-    read_buf: BytesMut,
+    /// What the peer sent and is not yet taken: wiped before its block is released.
+    read_buf: WipingBuf,
     read_buf_strategy: ReadStrategy,
     write_buf: WriteBuf<B>,
 }
@@ -68,7 +77,7 @@ where
             io,
             partial_len: None,
             read_blocked: false,
-            read_buf: BytesMut::with_capacity(0),
+            read_buf: WipingBuf::with_capacity(0),
             read_buf_strategy: ReadStrategy::default(),
             write_buf,
         }
@@ -241,6 +250,12 @@ where
         if self.read_buf_remaining_mut() < next {
             self.read_buf.reserve(next);
         }
+        // The read buffer grows only through the wiping reserve: `chunk_mut` on a full
+        // `BytesMut` grows it itself (by `CHUNK_MUT_GROWTH`) and frees the old block with the
+        // peer's bytes still in it, so that same growth is made here first.
+        if self.read_buf_remaining_mut() == 0 {
+            self.read_buf.reserve(CHUNK_MUT_GROWTH);
+        }
 
         // SAFETY: ReadBuf and poll_read promise not to set any uninitialized
         // bytes onto `dst`.
@@ -268,7 +283,7 @@ where
     }
 
     pub(crate) fn into_inner(self) -> (T, Bytes) {
-        (self.io, self.read_buf.freeze())
+        (self.io, self.read_buf.into_bytes())
     }
 
     pub(crate) fn is_read_blocked(&self) -> bool {
@@ -361,10 +376,13 @@ where
     fn read_mem(&mut self, cx: &mut Context<'_>, len: usize) -> Poll<io::Result<Bytes>> {
         if !self.read_buf.is_empty() {
             let n = std::cmp::min(len, self.read_buf.len());
-            Poll::Ready(Ok(self.read_buf.split_to(n).freeze()))
+            Poll::Ready(Ok(wipe::split_to(&mut self.read_buf, n)))
         } else {
             let n = ready!(self.poll_read_from_io(cx))?;
-            Poll::Ready(Ok(self.read_buf.split_to(::std::cmp::min(len, n)).freeze()))
+            Poll::Ready(Ok(wipe::split_to(
+                &mut self.read_buf,
+                ::std::cmp::min(len, n),
+            )))
         }
     }
 }
@@ -720,7 +738,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            buffered.read_buf,
+            buffered.read_buf[..],
             b"HTTP/1.1 200 OK\r\nServer: hyper\r\n"[..]
         );
     }

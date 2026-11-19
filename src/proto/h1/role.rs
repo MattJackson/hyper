@@ -222,7 +222,9 @@ impl Http1Transaction for Server {
             }
         };
 
-        let slice = buf.split_to(len).freeze();
+        // The head (and every header value and the URI sliced from it) is held in a block that
+        // is wiped when the last of them is dropped; its bytes in the read buffer are wiped now.
+        let slice = super::wipe::split_to(buf, len);
         let uri = {
             let uri_bytes = slice.slice_ref(&slice[path_range]);
             // TODO(lucab): switch to `Uri::from_shared()` once public.
@@ -1110,7 +1112,8 @@ impl Http1Transaction for Client {
                 }
             }
 
-            let slice = slice.freeze();
+            // Held in a wiping block, as the server's head is; wiped in the read buffer now.
+            let slice = super::wipe::hold(&mut slice);
 
             let mut headers = ctx.cached_headers.take().unwrap_or_default();
 
@@ -1553,13 +1556,19 @@ impl Client {
 
         // TODO(perf): we could do the moves in-place, but this is so uncommon
         // that it shouldn't matter.
-        let mut unfolded = trim_end(&buf[..first_nl]).to_vec();
+        //
+        // Unfolding never lengthens the value (each line break and the whitespace around it
+        // becomes one space), so the copy is made in one block sized to the value, never moved,
+        // and wiped before it is freed.
+        let mut unfolded = Vec::with_capacity(buf.len());
+        unfolded.extend_from_slice(trim_end(&buf[..first_nl]));
         for line in buf[first_nl + 1..].split(|b| *b == b'\n') {
             unfolded.push(b' ');
             unfolded.extend_from_slice(trim(line));
         }
         buf[..unfolded.len()].copy_from_slice(&unfolded);
         idx.value.1 = idx.value.0 + unfolded.len();
+        zeroize::Zeroize::zeroize(&mut unfolded[..]);
     }
 }
 

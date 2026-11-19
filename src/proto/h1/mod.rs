@@ -18,6 +18,7 @@ pub(crate) mod dispatch;
 mod encode;
 mod io;
 mod role;
+mod wipe;
 
 cfg_client! {
     pub(crate) type ClientTransaction = role::Client;

@@ -3278,6 +3278,80 @@ async fn http2_check_date_header_disabled() {
     assert!(resp.headers().get("Date").is_none());
 }
 
+#[tokio::test]
+async fn http2_incoming_body_reports_stream_id() {
+    let (listener, addr) = setup_tcp_listener();
+
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.expect("accept");
+        let socket = TokioIo::new(socket);
+
+        http2::Builder::new(TokioExecutor)
+            .serve_connection(
+                socket,
+                service_fn(|req: Request<IncomingBody>| async move {
+                    let id = req.body().h2_stream_id().expect("h2 stream id");
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(id.to_string()))))
+                }),
+            )
+            .await
+            .expect("serve_connection");
+    });
+
+    let tcp = TokioIo::new(connect_async(addr).await);
+    let (mut client, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor)
+        .handshake(tcp)
+        .await
+        .expect("http handshake");
+
+    tokio::spawn(async move {
+        conn.await.expect("client conn");
+    });
+
+    for expected in [1u32, 3, 5] {
+        let req = http::Request::new(Empty::<Bytes>::new());
+        let resp = client.send_request(req).await.expect("client.send_request");
+        assert_eq!(resp.body().h2_stream_id(), Some(expected));
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        assert_eq!(body, expected.to_string());
+    }
+}
+
+#[tokio::test]
+async fn http1_incoming_body_has_no_stream_id() {
+    let (listener, addr) = setup_tcp_listener();
+
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.expect("accept");
+        let socket = TokioIo::new(socket);
+
+        http1::Builder::new()
+            .serve_connection(
+                socket,
+                service_fn(|req: Request<IncomingBody>| async move {
+                    assert_eq!(req.body().h2_stream_id(), None);
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                }),
+            )
+            .await
+            .expect("serve_connection");
+    });
+
+    let tcp = TokioIo::new(connect_async(addr).await);
+    let (mut client, conn) = hyper::client::conn::http1::handshake(tcp)
+        .await
+        .expect("http handshake");
+
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = http::Request::new(Empty::<Bytes>::new());
+    let resp = client.send_request(req).await.expect("client.send_request");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.body().h2_stream_id(), None);
+}
+
 fn is_ping_frame(buf: &[u8]) -> bool {
     buf[3] == 6
 }

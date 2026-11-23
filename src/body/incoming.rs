@@ -75,6 +75,19 @@ enum Kind {
 pub(crate) use super::chan::Sender;
 
 impl Incoming {
+    /// TODO(owner): doc in your own words.
+    pub fn h2_stream_id(&self) -> Option<u32> {
+        match &self.kind {
+            Kind::Empty => None,
+            #[cfg(all(feature = "http1", any(feature = "client", feature = "server")))]
+            Kind::Chan { .. } => None,
+            #[cfg(all(feature = "http2", any(feature = "client", feature = "server")))]
+            Kind::H2 { recv, .. } => Some(recv.stream_id().into()),
+            #[cfg(feature = "ffi")]
+            Kind::Ffi(..) => None,
+        }
+    }
+
     /// Create a `Body` stream with an associated sender half.
     ///
     /// Useful when wanting to stream chunks from another thread.

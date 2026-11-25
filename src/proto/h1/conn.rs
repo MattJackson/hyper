@@ -813,14 +813,14 @@ where
 
         let state = match &mut self.state.writing {
             Writing::Body(encoder) => {
-                let encoded = encoder.encode(chunk);
+                let buf = encoder.encode(chunk);
                 // A length-stated body is complete at its last byte: that write ends the message.
-                let mut plan = encoded.serialization();
+                let mut plan = buf.serialization();
                 if encoder.is_eof() {
                     plan.end = Some(crate::serialization::End::Flush);
                 }
                 self.serialization.state(&plan);
-                self.io.buffer(encoded);
+                self.io.buffer(buf);
 
                 if !encoder.is_eof() {
                     return;

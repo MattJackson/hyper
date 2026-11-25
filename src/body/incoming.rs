@@ -91,6 +91,8 @@ impl Incoming {
     /// HTTP/2, after [`Incoming::manual_flow_control`]: reopen the receive window by `len` bytes that
     /// were read from this body. More than was read is ignored by the stream. No effect on HTTP/1.
     pub fn release_capacity(&mut self, len: usize) {
+        #[cfg(not(all(feature = "http2", any(feature = "client", feature = "server"))))]
+        let _ = len;
         match &mut self.kind {
             #[cfg(all(feature = "http2", any(feature = "client", feature = "server")))]
             Kind::H2 { recv, .. } => {
@@ -285,6 +287,7 @@ impl Body for Incoming {
                 content_length: _,
                 data_done: _,
                 ping: _,
+                manual: _,
             } => h2.is_end_stream(),
             #[cfg(feature = "ffi")]
             Kind::Ffi(..) => false,
@@ -317,6 +320,7 @@ impl Body for Incoming {
                 data_done: _,
                 ping: _,
                 recv: _,
+                manual: _,
             } => opt_len(content_length),
             #[cfg(feature = "ffi")]
             Kind::Ffi(..) => SizeHint::default(),

@@ -221,6 +221,33 @@ impl Encoder {
         }
     }
 
+    /// The runs `encode_and_end` writes for a last chunk of `len` bytes, and the message's end.
+    pub(crate) fn serialization_and_end(&self, len: usize) -> crate::serialization::Plan {
+        use crate::serialization::{End, Plan};
+        let mut plan = Plan::new();
+        match self.kind {
+            Kind::Chunked(_) => {
+                plan.control(ChunkSize::new(len).remaining());
+                plan.payload(len);
+                // The chunk's line end and the last chunk (`0\r\n\r\n`).
+                plan.control(2 + 5);
+                plan.end = Some(End::Flush);
+            }
+            Kind::Length(remaining) => {
+                plan.payload((len as u64).min(remaining) as usize);
+                if len as u64 >= remaining {
+                    plan.end = Some(End::Flush);
+                }
+            }
+            #[cfg(feature = "server")]
+            Kind::CloseDelimited => {
+                plan.payload(len);
+                plan.end = Some(End::Shutdown);
+            }
+        }
+        plan
+    }
+
     pub(super) fn encode_and_end<B>(
         &self,
         msg: B,
@@ -287,6 +314,29 @@ fn is_valid_trailer_field(name: &HeaderName) -> bool {
             | TRANSFER_ENCODING
             | TE
     )
+}
+
+impl<B: Buf> EncodedBuf<B> {
+    /// The runs of this encoded unit.
+    pub(crate) fn serialization(&self) -> crate::serialization::Plan {
+        use crate::serialization::Plan;
+        let mut plan = Plan::new();
+        match &self.kind {
+            BufKind::Exact(b) => plan.payload(b.remaining()),
+            BufKind::Limited(b) => plan.payload(b.remaining()),
+            BufKind::Chunked(b) => {
+                let (head_body, tail) = (b.first_ref(), b.last_ref());
+                let (head, body) = (head_body.first_ref(), head_body.last_ref());
+                plan.control(head.remaining());
+                plan.payload(body.remaining());
+                plan.control(tail.remaining());
+            }
+            BufKind::ChunkedEnd(_) | BufKind::Trailers(_) => {
+                plan.control(self.remaining());
+            }
+        }
+        plan
+    }
 }
 
 impl<B> Buf for EncodedBuf<B>
@@ -703,5 +753,49 @@ mod tests {
         let mut dst = Vec::new();
         dst.put(buf);
         assert_eq!(dst, b"0\r\nchunky-trailer: trailer value\r\n\r\n");
+    }
+}
+
+#[cfg(test)]
+mod serialization_tests {
+    use super::*;
+    use crate::serialization::{End, Run};
+
+    fn run(payload: bool, len: usize) -> Run {
+        Run { payload, len }
+    }
+
+    #[test]
+    fn a_length_body_is_payload_up_to_its_limit_and_a_chunk_is_framed_by_control() {
+        let mut exact = Encoder::length(3);
+        let buf = exact.encode(&b"abcdef"[..]);
+        assert_eq!(buf.serialization().as_slice(), [run(true, 3)]);
+
+        let mut chunked = Encoder::chunked();
+        let buf = chunked.encode(&b"abc"[..]);
+        assert_eq!(
+            buf.serialization().as_slice(),
+            [run(false, 3), run(true, 3), run(false, 2)]
+        );
+        let end = chunked.end::<&[u8]>().unwrap().unwrap();
+        assert_eq!(end.serialization().as_slice(), [run(false, 5)]);
+    }
+
+    #[test]
+    fn the_fast_end_states_the_end_only_when_the_message_is_complete() {
+        let plan = Encoder::chunked().serialization_and_end(3);
+        assert_eq!(
+            plan.as_slice(),
+            [run(false, 3), run(true, 3), run(false, 7)]
+        );
+        assert_eq!(plan.end, Some(End::Flush));
+
+        let short = Encoder::length(4).serialization_and_end(3);
+        assert_eq!(short.as_slice(), [run(true, 3)]);
+        assert_eq!(short.end, None);
+
+        let over = Encoder::length(3).serialization_and_end(5);
+        assert_eq!(over.as_slice(), [run(true, 3)]);
+        assert_eq!(over.end, Some(End::Flush));
     }
 }

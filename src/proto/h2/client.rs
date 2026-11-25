@@ -62,6 +62,7 @@ const DEFAULT_INITIAL_MAX_SEND_STREAMS: usize = 100;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
+    pub(crate) labels: Option<std::sync::Arc<dyn crate::serialization::Labels>>,
     pub(crate) adaptive_window: bool,
     pub(crate) initial_conn_window_size: u32,
     pub(crate) initial_stream_window_size: u32,
@@ -83,6 +84,7 @@ pub(crate) struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
+            labels: None,
             adaptive_window: false,
             initial_conn_window_size: DEFAULT_CONN_WINDOW,
             initial_stream_window_size: DEFAULT_STREAM_WINDOW,
@@ -105,6 +107,11 @@ impl Default for Config {
 
 fn new_builder(config: &Config) -> Builder {
     let mut builder = Builder::default();
+    if let Some(labels) = &config.labels {
+        builder.labels(std::sync::Arc::new(crate::serialization::H2Labels(
+            labels.clone(),
+        )));
+    }
     builder
         .initial_max_send_streams(config.initial_max_send_streams)
         .initial_window_size(config.initial_stream_window_size)
@@ -195,6 +202,7 @@ where
 
     Ok(ClientTask {
         ping,
+        labels: config.labels.clone(),
         conn_drop_ref,
         conn_eof,
         executor: exec,
@@ -429,6 +437,8 @@ where
     B: Body,
     E: Unpin,
 {
+    /// The label sink: told which wire stream each submitted request got (or that it got none).
+    labels: Option<std::sync::Arc<dyn crate::serialization::Labels>>,
     ping: ping::Recorder,
     conn_drop_ref: ConnDropRef,
     conn_eof: ConnEof,
@@ -750,6 +760,9 @@ where
                     // check that future hasn't been canceled already
                     if cb.is_canceled() {
                         trace!("request callback is canceled");
+                        if let Some(labels) = &self.labels {
+                            labels.request(None);
+                        }
                         continue;
                     }
                     let (head, body) = req.into_parts();
@@ -770,6 +783,9 @@ where
                             .map_or(false, |len| len != 0)
                     {
                         debug!("h2 connect request with non-zero body not supported");
+                        if let Some(labels) = &self.labels {
+                            labels.request(None);
+                        }
                         cb.send(Err(TrySendError {
                             error: crate::Error::new_user_invalid_connect(),
                             message: None,
@@ -780,11 +796,28 @@ where
                     if let Some(protocol) = req.extensions_mut().remove::<Protocol>() {
                         req.extensions_mut().insert(protocol.into_inner());
                     }
+                    // Sealed places in the target travel to the header encoder as h2's own type.
+                    if let Some(sealed) = req
+                        .extensions_mut()
+                        .remove::<crate::serialization::SealedTarget>()
+                    {
+                        req.extensions_mut().insert(h2::serialization::SealedPath(
+                            sealed.0.iter().map(|s| (s.offset, s.len)).collect(),
+                        ));
+                    }
 
                     let (fut, body_tx) = match self.h2_tx.send_request(req, !is_connect && eos) {
-                        Ok(ok) => ok,
+                        Ok(ok) => {
+                            if let Some(labels) = &self.labels {
+                                labels.request(Some(ok.0.stream_id().as_u32()));
+                            }
+                            ok
+                        }
                         Err(err) => {
                             debug!("client send request error: {}", err);
+                            if let Some(labels) = &self.labels {
+                                labels.request(None);
+                            }
                             cb.send(Err(TrySendError {
                                 error: crate::Error::new_h2(err),
                                 message: None,

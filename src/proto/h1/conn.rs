@@ -38,7 +38,38 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 pub(crate) struct Conn<I, B, T> {
     io: Buffered<I, EncodedBuf<B>>,
     state: State,
+    serialization: H1Serialization,
     _marker: PhantomData<fn(T)>,
+}
+
+/// The labels of this connection's output: the sink, and the message being encoded (0: none).
+#[derive(Default)]
+struct H1Serialization {
+    labels: Option<std::sync::Arc<dyn crate::serialization::Labels>>,
+    identity: u64,
+}
+
+impl H1Serialization {
+    /// States one encoded unit of the current message. Its end closes the message.
+    fn state(&mut self, plan: &crate::serialization::Plan) {
+        if let Some(labels) = &self.labels {
+            plan.state(labels.as_ref(), self.identity);
+        }
+        if plan.end.is_some() {
+            self.identity = 0;
+        }
+    }
+}
+
+/// A message still being encoded when its connection goes is one the encoder gave up.
+impl Drop for H1Serialization {
+    fn drop(&mut self) {
+        if self.identity != 0 {
+            if let Some(labels) = &self.labels {
+                labels.end(self.identity, crate::serialization::End::Failed(0));
+            }
+        }
+    }
 }
 
 impl<I, B, T> Conn<I, B, T>
@@ -85,8 +116,14 @@ where
                 version: Version::HTTP_11,
                 allow_trailer_fields: false,
             },
+            serialization: H1Serialization::default(),
             _marker: PhantomData,
         }
+    }
+
+    /// Installs the label sink: every byte this connection encodes from here on is labelled.
+    pub(crate) fn set_labels(&mut self, labels: std::sync::Arc<dyn crate::serialization::Labels>) {
+        self.serialization.labels = Some(labels);
     }
 
     #[cfg(feature = "server")]
@@ -413,6 +450,10 @@ where
                 if let Writing::Init = self.state.writing {
                     trace!("automatically sending 100 Continue");
                     let cont = b"HTTP/1.1 100 Continue\r\n\r\n";
+                    // The connection's own answer: stream 0.
+                    if let Some(labels) = &self.serialization.labels {
+                        labels.span(0, false, cont.len());
+                    }
                     self.io.headers_buf().extend_from_slice(cont);
                 }
 
@@ -633,7 +674,21 @@ where
 
         self.enforce_version(&mut head);
 
+        // The sink names the message about to be encoded; a sealed value is left out of the head and
+        // marked (client only: a server writes every value it is given).
+        self.serialization.identity = self
+            .serialization
+            .labels
+            .as_ref()
+            .map_or(0, |labels| labels.message());
+        let mut marks = if self.serialization.labels.is_some() && T::is_client() {
+            crate::serialization::Marks::on()
+        } else {
+            crate::serialization::Marks::default()
+        };
         let buf = self.io.headers_buf();
+        let before = buf.len();
+
         match super::role::encode_headers::<T>(
             Encode {
                 head: &mut head,
@@ -644,10 +699,31 @@ where
                 title_case_headers: self.state.title_case_headers,
                 #[cfg(feature = "server")]
                 date_header: self.state.date_header,
+                marks: &mut marks,
             },
             buf,
         ) {
             Ok(encoder) => {
+                if let Some(labels) = &self.serialization.labels {
+                    crate::serialization::state_head(
+                        labels.as_ref(),
+                        self.serialization.identity,
+                        before,
+                        buf.len(),
+                        &marks,
+                    );
+                    // A head that is the whole message (no body follows) ends it.
+                    if encoder.is_eof() {
+                        labels.end(
+                            self.serialization.identity,
+                            crate::serialization::End::Flush,
+                        );
+                    }
+                }
+                if encoder.is_eof() {
+                    self.serialization.identity = 0;
+                }
+
                 debug_assert!(self.state.cached_headers.is_none());
                 debug_assert!(head.headers.is_empty());
                 self.state.cached_headers = Some(head.headers);
@@ -737,7 +813,14 @@ where
 
         let state = match &mut self.state.writing {
             Writing::Body(encoder) => {
-                self.io.buffer(encoder.encode(chunk));
+                let encoded = encoder.encode(chunk);
+                // A length-stated body is complete at its last byte: that write ends the message.
+                let mut plan = encoded.serialization();
+                if encoder.is_eof() {
+                    plan.end = Some(crate::serialization::End::Flush);
+                }
+                self.serialization.state(&plan);
+                self.io.buffer(encoded);
 
                 if !encoder.is_eof() {
                     return;
@@ -767,6 +850,9 @@ where
                 if let Some(enc_buf) =
                     encoder.encode_trailers(trailers, self.state.title_case_headers)
                 {
+                    let mut plan = enc_buf.serialization();
+                    plan.end = Some(crate::serialization::End::Flush);
+                    self.serialization.state(&plan);
                     self.io.buffer(enc_buf);
 
                     self.state.writing = if encoder.is_last() || encoder.is_close_delimited() {
@@ -786,14 +872,26 @@ where
         debug_assert!(chunk.remaining() != 0);
 
         let state = match &mut self.state.writing {
-            Writing::Body(encoder) => match encoder.encode_and_end(chunk, self.io.write_buf()) {
-                Ok(true) => Writing::KeepAlive,
-                Ok(false) => Writing::Closed,
-                Err(not_eof) => {
-                    self.state.writing = Writing::Closed;
-                    return Err(crate::Error::new_body_write_aborted().with(not_eof));
+            Writing::Body(encoder) => {
+                let plan = encoder.serialization_and_end(chunk.remaining());
+                self.serialization.state(&plan);
+                match encoder.encode_and_end(chunk, self.io.write_buf()) {
+                    Ok(true) => Writing::KeepAlive,
+                    Ok(false) => Writing::Closed,
+                    Err(not_eof) => {
+                        // The last chunk ended short of the stated length: the message is given up.
+                        if let Some(labels) = &self.serialization.labels {
+                            labels.end(
+                                self.serialization.identity,
+                                crate::serialization::End::Failed(0),
+                            );
+                        }
+                        self.serialization.identity = 0;
+                        self.state.writing = Writing::Closed;
+                        return Err(crate::Error::new_body_write_aborted().with(not_eof));
+                    }
                 }
-            },
+            }
             _ => unreachable!("write_body invalid state: {:?}", self.state.writing),
         };
 
@@ -812,6 +910,17 @@ where
         // end of stream, that means we should try to eof
         match encoder.end() {
             Ok(end) => {
+                let mut plan = crate::serialization::Plan::new();
+                if let Some(ref end) = end {
+                    plan.append(&end.serialization());
+                }
+                plan.end = Some(if encoder.is_close_delimited() {
+                    crate::serialization::End::Shutdown
+                } else {
+                    crate::serialization::End::Flush
+                });
+                self.serialization.state(&plan);
+
                 if let Some(end) = end {
                     self.io.buffer(end);
                 }
@@ -825,6 +934,14 @@ where
                 Ok(())
             }
             Err(not_eof) => {
+                // The body ended short of its stated length: the message is given up.
+                if let Some(labels) = &self.serialization.labels {
+                    labels.end(
+                        self.serialization.identity,
+                        crate::serialization::End::Failed(0),
+                    );
+                }
+                self.serialization.identity = 0;
                 self.state.writing = Writing::Closed;
                 Err(crate::Error::new_body_write_aborted().with(not_eof))
             }
@@ -857,6 +974,7 @@ where
 
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(Pin::new(&mut self.io).poll_flush(cx))?;
+
         self.try_keep_alive(cx);
         trace!("flushed({}): {:?}", T::LOG, self.state);
         Poll::Ready(Ok(()))

@@ -70,6 +70,7 @@ pin_project_lite::pin_project! {
 /// to bind the built connection to a service.
 #[derive(Clone, Debug)]
 pub struct Builder {
+    labels: Option<std::sync::Arc<dyn crate::serialization::Labels>>,
     h1_parser_config: ParserConfig,
     timer: Time,
     h1_half_close: bool,
@@ -239,9 +240,19 @@ where
 // ===== impl Builder =====
 
 impl Builder {
+    /// Label every byte this connection encodes (see [`crate::serialization::Labels`]).
+    pub fn labels(
+        &mut self,
+        labels: std::sync::Arc<dyn crate::serialization::Labels>,
+    ) -> &mut Self {
+        self.labels = Some(labels);
+        self
+    }
+
     /// Create a new connection builder.
     pub fn new() -> Self {
         Self {
+            labels: None,
             h1_parser_config: ParserConfig::default(),
             timer: Time::Empty,
             h1_half_close: false,
@@ -476,6 +487,9 @@ impl Builder {
         I: Read + Write + Unpin,
     {
         let mut conn = proto::Conn::new(io);
+        if let Some(labels) = &self.labels {
+            conn.set_labels(labels.clone());
+        }
         conn.set_h1_parser_config(self.h1_parser_config.clone());
         conn.set_timer(self.timer.clone());
         if !self.h1_keep_alive {

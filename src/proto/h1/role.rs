@@ -222,7 +222,9 @@ impl Http1Transaction for Server {
             }
         };
 
-        let slice = buf.split_to(len).freeze();
+        // The head (and every header value and the URI sliced from it) is held in a block that
+        // is wiped when the last of them is dropped; its bytes in the read buffer are wiped now.
+        let slice = super::wipe::split_to(buf, len);
         let uri = {
             let uri_bytes = slice.slice_ref(&slice[path_range]);
             // TODO(lucab): switch to `Uri::from_shared()` once public.
@@ -1113,7 +1115,8 @@ impl Http1Transaction for Client {
                 }
             }
 
-            let slice = slice.freeze();
+            // Held in a wiping block, as the server's head is; wiped in the read buffer now.
+            let slice = super::wipe::hold(&mut slice);
 
             let mut headers = ctx.cached_headers.take().unwrap_or_default();
 
@@ -1239,7 +1242,32 @@ impl Http1Transaction for Client {
         extend(dst, msg.head.subject.0.as_str().as_bytes());
         extend(dst, b" ");
         //TODO: add API to http::Uri to encode without std::fmt
+        let target_at = dst.len();
         let _ = write!(FastWrite(dst), "{} ", msg.head.subject.1);
+        // Sealed places in the target: the filler is taken out again and its place marked. The spans
+        // are offsets into the target as supplied, ascending.
+        if msg.marks.on {
+            if let Some(sealed) = msg
+                .head
+                .extensions
+                .get::<crate::serialization::SealedTarget>()
+            {
+                let mut removed = 0usize;
+                for span in &sealed.0 {
+                    let (offset, len) = (span.offset as usize, span.len as usize);
+                    let at = target_at + offset - removed;
+                    // A span outside the written target is the caller's error. Nothing more is sealed:
+                    // what is left written is filler, which says nothing, and whoever owns the
+                    // connection sees a slot that was never placed.
+                    if offset < removed || at + len + 1 > dst.len() {
+                        break;
+                    }
+                    dst.drain(at..at + len);
+                    msg.marks.push(at, len);
+                    removed += len;
+                }
+            }
+        }
 
         match msg.head.version {
             Version::HTTP_10 => extend(dst, b"HTTP/1.0"),
@@ -1260,6 +1288,8 @@ impl Http1Transaction for Client {
                 dst,
                 msg.title_case_headers,
             );
+        } else if msg.marks.on {
+            write_headers_sealing(&msg.head.headers, dst, msg.marks, msg.title_case_headers);
         } else if msg.title_case_headers {
             write_headers_title_case(&msg.head.headers, dst);
         } else {
@@ -1537,13 +1567,19 @@ impl Client {
 
         // TODO(perf): we could do the moves in-place, but this is so uncommon
         // that it shouldn't matter.
-        let mut unfolded = trim_end(&buf[..first_nl]).to_vec();
+        //
+        // Unfolding never lengthens the value (each line break and the whitespace around it
+        // becomes one space), so the copy is made in one block sized to the value, never moved,
+        // and wiped before it is freed.
+        let mut unfolded = Vec::with_capacity(buf.len());
+        unfolded.extend_from_slice(trim_end(&buf[..first_nl]));
         for line in buf[first_nl + 1..].split(|b| *b == b'\n') {
             unfolded.push(b' ');
             unfolded.extend_from_slice(trim(line));
         }
         buf[..unfolded.len()].copy_from_slice(&unfolded);
         idx.value.1 = idx.value.0 + unfolded.len();
+        zeroize::Zeroize::zeroize(&mut unfolded[..]);
     }
 }
 
@@ -1642,6 +1678,31 @@ pub(crate) fn write_headers(headers: &HeaderMap, dst: &mut Vec<u8>) {
         extend(dst, name.as_str().as_bytes());
         extend(dst, b": ");
         extend(dst, value.as_bytes());
+        extend(dst, b"\r\n");
+    }
+}
+
+/// As `write_headers`, for a connection with a label sink: a value marked sensitive is a sealed value.
+/// Its name and separator are written, its bytes are not, and its place is marked.
+#[cfg(feature = "client")]
+fn write_headers_sealing(
+    headers: &HeaderMap,
+    dst: &mut Vec<u8>,
+    marks: &mut crate::serialization::Marks,
+    title_case_headers: bool,
+) {
+    for (name, value) in headers {
+        if title_case_headers {
+            title_case(dst, name.as_str().as_bytes());
+        } else {
+            extend(dst, name.as_str().as_bytes());
+        }
+        extend(dst, b": ");
+        if value.is_sensitive() {
+            marks.push(dst.len(), value.len());
+        } else {
+            extend(dst, value.as_bytes());
+        }
         extend(dst, b"\r\n");
     }
 }
@@ -2801,6 +2862,7 @@ mod tests {
                             title_case_headers: false,
                             #[cfg(feature = "server")]
                             date_header: true,
+                            marks: &mut crate::serialization::Marks::default(),
                         },
                         &mut vec,
                     )
@@ -2857,6 +2919,7 @@ mod tests {
                     title_case_headers: false,
                     #[cfg(feature = "server")]
                     date_header: true,
+                    marks: &mut crate::serialization::Marks::default(),
                 },
                 &mut vec,
             )
@@ -2898,6 +2961,7 @@ mod tests {
                 title_case_headers: true,
                 #[cfg(feature = "server")]
                 date_header: true,
+                marks: &mut crate::serialization::Marks::default(),
             },
             &mut vec,
         )
@@ -2932,6 +2996,7 @@ mod tests {
                 title_case_headers: false,
                 #[cfg(feature = "server")]
                 date_header: true,
+                marks: &mut crate::serialization::Marks::default(),
             },
             &mut vec,
         )
@@ -2969,6 +3034,7 @@ mod tests {
                 title_case_headers: true,
                 #[cfg(feature = "server")]
                 date_header: true,
+                marks: &mut crate::serialization::Marks::default(),
             },
             &mut vec,
         )
@@ -2995,6 +3061,7 @@ mod tests {
                 req_method: &mut Some(Method::CONNECT),
                 title_case_headers: false,
                 date_header: true,
+                marks: &mut crate::serialization::Marks::default(),
             },
             &mut vec,
         )
@@ -3026,6 +3093,7 @@ mod tests {
                 req_method: &mut None,
                 title_case_headers: true,
                 date_header: true,
+                marks: &mut crate::serialization::Marks::default(),
             },
             &mut vec,
         )
@@ -3062,6 +3130,7 @@ mod tests {
                 req_method: &mut None,
                 title_case_headers: false,
                 date_header: true,
+                marks: &mut crate::serialization::Marks::default(),
             },
             &mut vec,
         )
@@ -3098,6 +3167,7 @@ mod tests {
                 req_method: &mut None,
                 title_case_headers: true,
                 date_header: true,
+                marks: &mut crate::serialization::Marks::default(),
             },
             &mut vec,
         )
@@ -3135,6 +3205,7 @@ mod tests {
                 req_method: &mut None,
                 title_case_headers: true,
                 date_header: false,
+                marks: &mut crate::serialization::Marks::default(),
             },
             &mut vec,
         )
@@ -3599,6 +3670,7 @@ mod tests {
                     req_method: &mut Some(Method::GET),
                     title_case_headers: false,
                     date_header: true,
+                    marks: &mut crate::serialization::Marks::default(),
                 },
                 &mut vec,
             )
@@ -3628,6 +3700,7 @@ mod tests {
                     req_method: &mut Some(Method::GET),
                     title_case_headers: false,
                     date_header: true,
+                    marks: &mut crate::serialization::Marks::default(),
                 },
                 &mut vec,
             )

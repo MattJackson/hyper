@@ -42,6 +42,7 @@ const DEFAULT_MAX_LOCAL_ERROR_RESET_STREAMS: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Config {
+    pub(crate) labels: Option<std::sync::Arc<dyn crate::serialization::Labels>>,
     pub(crate) adaptive_window: bool,
     pub(crate) initial_conn_window_size: u32,
     pub(crate) initial_stream_window_size: u32,
@@ -61,6 +62,7 @@ pub(crate) struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
+            labels: None,
             adaptive_window: false,
             initial_conn_window_size: DEFAULT_CONN_WINDOW,
             initial_stream_window_size: DEFAULT_STREAM_WINDOW,
@@ -133,6 +135,11 @@ where
         timer: Time,
     ) -> Server<T, S, B, E> {
         let mut builder = h2::server::Builder::default();
+        if let Some(labels) = &config.labels {
+            builder.labels(std::sync::Arc::new(crate::serialization::H2Labels(
+                labels.clone(),
+            )));
+        }
         builder
             .initial_window_size(config.initial_stream_window_size)
             .initial_connection_window_size(config.initial_conn_window_size)
@@ -471,6 +478,7 @@ where
                     };
 
                     let (head, body) = res.into_parts();
+
                     let mut res = ::http::Response::from_parts(head, ());
                     super::strip_connection_headers(
                         res.headers_mut(),

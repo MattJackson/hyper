@@ -350,3 +350,6 @@ required-features = ["full"]
 name = "h1_ready_in_flight"
 path = "tests/h1_ready_in_flight.rs"
 required-features = ["full"]
+
+[patch.crates-io]
+h2 = { git = "https://github.com/MattJackson/h2", branch = "busbar/rebased-2026-11-25" }
